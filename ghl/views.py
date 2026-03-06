@@ -24,7 +24,34 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.db import connection
+
 from .models import GHLLocation, GHLOpportunity
+
+
+def _row_to_opportunity_dict(row, columns):
+    """Convert a raw SQL row to API dict format (id, contact_name, etc.)."""
+    d = dict(zip(columns, row))
+    return {
+        'id': d.get('opportunity_id') or '',
+        'location_id': d.get('location_id') or '',
+        'location_name': d.get('location_id') or '',  # opportunity_report has no location_name
+        'contact_name': d.get('contact_name') or '-',
+        'contact_email': d.get('email') or '-',
+        'contact_phone': d.get('phone') or '-',
+        'company_name': d.get('company_name') or '',
+        'name': d.get('opportunity_name') or '-',
+        'status': d.get('status') or '-',
+        'monetary_value': d.get('monetary_value'),
+        'contact_id': d.get('contact_id') or '',
+        'pipeline_id': d.get('pipeline_id') or '',
+        'pipeline_stage_id': d.get('pipeline_stage_id') or '',
+        'assigned_to': d.get('assigned_to') or '',
+        'source': d.get('source') or '',
+        'date_added': d.get('created_at').isoformat() if d.get('created_at') else None,
+        'updated_at': d.get('updated_at').isoformat() if d.get('updated_at') else None,
+        'raw_data': {},  # opportunity_report has no raw JSON
+    }
 
 
 def _serialize_opportunity(opp):
@@ -93,37 +120,100 @@ def _matches_search(item, q):
     return id_val != '-' and q_lower in id_val.lower()
 
 
+def _fetch_from_opportunity_report(page, page_size, search):
+    """Fetch opportunities from opportunity_report table (PostgreSQL)."""
+    import re
+    cols = [
+        'opportunity_id', 'pipeline_id', 'pipeline_stage_id', 'assigned_to', 'contact_id',
+        'location_id', 'lost_reason_id', 'opportunity_name', 'monetary_value', 'status', 'source',
+        'last_status_change_at', 'last_stage_change_at', 'created_at', 'updated_at',
+        'contact_name', 'email', 'phone', 'company_name'
+    ]
+    col_list = ', '.join(cols)
+    if search:
+        q = search.strip()
+        q_esc = q.replace('%', '\\%').replace('_', '\\_')
+        q_digits = re.sub(r'\D', '', q)
+        conditions = [
+            "opportunity_id ILIKE %s",
+            "contact_name ILIKE %s",
+            "email ILIKE %s",
+            "COALESCE(phone::text, '') ILIKE %s",
+        ]
+        pattern = f'%{q_esc}%'
+        params = [pattern] * 4
+        if q_digits:
+            conditions.append("REGEXP_REPLACE(COALESCE(phone, ''), '[^0-9]', '', 'g') LIKE %s")
+            params.append(f'%{q_digits}%')
+        where = ' OR '.join(conditions)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT {col_list} FROM opportunity_report WHERE {where} ORDER BY updated_at DESC NULLS LAST",
+                params
+            )
+            rows = cursor.fetchall()
+        data = [_row_to_opportunity_dict(r, cols) for r in rows]
+        total_count = len(data)
+    else:
+        offset = (page - 1) * page_size
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT COUNT(*) FROM opportunity_report"
+            )
+            total_count = cursor.fetchone()[0]
+            cursor.execute(
+                f"SELECT {col_list} FROM opportunity_report ORDER BY updated_at DESC NULLS LAST LIMIT %s OFFSET %s",
+                [page_size, offset]
+            )
+            rows = cursor.fetchall()
+        data = [_row_to_opportunity_dict(r, cols) for r in rows]
+    return data, total_count
+
+
 class OpportunityListView(APIView):
     """
     List opportunities with backend pagination and search.
+    Uses opportunity_report table when on PostgreSQL, else GHLOpportunity.
     GET /api/ghlpage/opportunities/?page=1&page_size=10&search=...
     """
     permission_classes = [AllowAny]
 
     def get(self, request):
+        from django.conf import settings as django_settings
+        from django.db import connections
+
         page = max(1, int(request.query_params.get('page', 1)))
         page_size = max(1, min(100, int(request.query_params.get('page_size', 10))))
         search = (request.query_params.get('search') or '').strip()
 
-        qs = GHLOpportunity.objects.select_related('location').order_by('-updated_at')
+        use_report_table = (
+            connections['default'].settings_dict['ENGINE'] == 'django.db.backends.postgresql'
+        )
 
-        if search:
-            data = []
-            for opp in qs:
-                item = _serialize_opportunity(opp)
-                if _matches_search(item, search):
-                    data.append(item)
-            total_count = len(data)
-        else:
-            from django.core.paginator import Paginator
-            paginator = Paginator(qs, page_size)
-            total_count = paginator.count
-            page_obj = paginator.get_page(page)
-            data = [_serialize_opportunity(opp) for opp in page_obj]
+        if use_report_table:
+            try:
+                data, total_count = _fetch_from_opportunity_report(page, page_size, search)
+            except Exception:
+                use_report_table = False
+
+        if not use_report_table:
+            qs = GHLOpportunity.objects.select_related('location').order_by('-updated_at')
+            if search:
+                data = []
+                for opp in qs:
+                    item = _serialize_opportunity(opp)
+                    if _matches_search(item, search):
+                        data.append(item)
+                total_count = len(data)
+            else:
+                from django.core.paginator import Paginator
+                paginator = Paginator(qs, page_size)
+                total_count = paginator.count
+                page_obj = paginator.get_page(page)
+                data = [_serialize_opportunity(opp) for opp in page_obj]
 
         total_pages = max(1, (total_count + page_size - 1) // page_size)
         if search:
-            page = 1
             total_pages = 1
 
         return Response({
@@ -158,8 +248,8 @@ class GHLOnboardView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-        version_id = request.query_params.get('version_id', '69aaf371cdd0ee5dc9618261')
-        auth_redirect_url = (
+        version_id = request.query_params.get('version_id', '69ab41154f90be25f703fe86')
+        auth_redirect_url = ( 
             f"{auth_url}?"
             f"response_type=code&"
             f"redirect_uri={redirect_uri}&"
@@ -197,7 +287,7 @@ class GHLOAuthAuthorizeView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-        version_id = request.query_params.get('version_id', '69aaf371cdd0ee5dc9618261')
+        version_id = request.query_params.get('version_id', '69ab41154f90be25f703fe86')
         auth_redirect_url = (
             f"{auth_url}?"
             f"response_type=code&"

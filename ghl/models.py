@@ -53,33 +53,3 @@ class GHLOpportunity(models.Model):
     def __str__(self):
         name = self.raw_data.get('name') or self.opportunity_id
         return f"{name} ({self.opportunity_id})"
-
-
-class OpportunityReport(models.Model):
-    """
-    Report table synced from GHL opportunities (HMG pipeline).
-    Updated whenever an opportunity is created/updated via webhook.
-    Uses db_table='opportunity_report' - if table exists with different schema, set managed=False.
-    """
-    opportunity_id = models.CharField(max_length=100, unique=True, primary_key=True)
-    location_id = models.CharField(max_length=100)
-    location_name = models.CharField(max_length=255, blank=True)
-    contact_name = models.CharField(max_length=255, blank=True)
-    contact_email = models.CharField(max_length=255, blank=True)
-    contact_phone = models.CharField(max_length=100, blank=True)
-    name = models.CharField(max_length=255, blank=True)
-    status = models.CharField(max_length=50, blank=True)
-    monetary_value = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    contact_id = models.CharField(max_length=100, blank=True)
-    pipeline_id = models.CharField(max_length=100, blank=True)
-    pipeline_stage_id = models.CharField(max_length=100, blank=True)
-    date_added = models.DateTimeField(null=True, blank=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = 'opportunity_report'
-        ordering = ['-updated_at']
-        verbose_name_plural = 'Opportunity reports'
-
-    def __str__(self):
-        return f"{self.contact_name or self.opportunity_id} ({self.opportunity_id})"

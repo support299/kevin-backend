@@ -7,9 +7,10 @@ import time
 from typing import Optional
 
 from django.conf import settings
-from django.db import OperationalError
+from django.db import OperationalError, connection
+from django.utils import timezone
 
-from .models import GHLLocation, GHLOpportunity, OpportunityReport
+from .models import GHLLocation, GHLOpportunity
 from .services import GHLClient
 
 logger = logging.getLogger(__name__)
@@ -98,8 +99,22 @@ def _fetch_and_store_opportunity(location_id: str, opportunity_id: str):
     logger.info("Stored opportunity %s for location %s (HMG pipeline)", opportunity_id, location_id)
 
 
-def _extract_opportunity_report_data(opportunity_id: str, location: GHLLocation, raw_data: dict) -> dict:
-    """Extract fields for opportunity_report from raw_data."""
+def _parse_dt(val):
+    """Parse datetime from string, return None if invalid."""
+    if not val:
+        return None
+    try:
+        from django.utils.dateparse import parse_datetime
+        return parse_datetime(val) if isinstance(val, str) else val
+    except (TypeError, ValueError):
+        return None
+
+
+def _upsert_opportunity_report(opportunity_id: str, location: GHLLocation, raw_data: dict):
+    """
+    Upsert into existing opportunity_report table (RDS) without altering it.
+    Maps GHL opportunity data to matching columns.
+    """
     data = raw_data if isinstance(raw_data, dict) else {}
     opp_obj = data.get('opportunity') if isinstance(data.get('opportunity'), dict) else data
     contact = (opp_obj.get('contact') or {}) if isinstance(opp_obj.get('contact'), dict) else {}
@@ -108,42 +123,89 @@ def _extract_opportunity_report_data(opportunity_id: str, location: GHLLocation,
         or (f"{contact.get('firstName', '')} {contact.get('lastName', '')}".strip() or '')
         or opp_obj.get('contactName', '')
         or opp_obj.get('contactId', '')
-    )
+    ) or ''
     emails = contact.get('emails') or []
     phones = contact.get('phones') or []
-    email = contact.get('email') or (emails[0].get('email') if emails and isinstance(emails[0], dict) else '')
-    phone_val = contact.get('phone') or (phones[0].get('phone') if phones and isinstance(phones[0], dict) else '')
-    date_added = None
-    if opp_obj.get('dateAdded'):
-        try:
-            from django.utils.dateparse import parse_datetime
-            date_added = parse_datetime(opp_obj['dateAdded'])
-        except (TypeError, ValueError):
-            pass
+    email = contact.get('email') or (emails[0].get('email') if emails and isinstance(emails[0], dict) else '') or ''
+    phone_val = contact.get('phone') or (phones[0].get('phone') if phones and isinstance(phones[0], dict) else '') or ''
+    company_name = contact.get('companyName') or contact.get('company') or ''
+    created_at = _parse_dt(opp_obj.get('dateAdded'))
+    updated_at = _parse_dt(opp_obj.get('dateUpdated')) or timezone.now()
+    last_status_change = _parse_dt(opp_obj.get('lastStatusChangeAt'))
+    last_stage_change = _parse_dt(opp_obj.get('lastStageChangeAt'))
+    assigned_to = opp_obj.get('assignedTo') or ''
+    lost_reason_id = opp_obj.get('lostReasonId') or ''
     monetary = opp_obj.get('monetaryValue')
-    return {
-        'opportunity_id': opportunity_id,
-        'location_id': location.location_id,
-        'location_name': location.company_name or location.location_id or '',
-        'contact_name': contact_name or '',
-        'contact_email': email or '',
-        'contact_phone': phone_val or '',
-        'name': opp_obj.get('name') or '',
-        'status': opp_obj.get('status') or '',
-        'monetary_value': monetary,
-        'contact_id': opp_obj.get('contactId') or '',
-        'pipeline_id': opp_obj.get('pipelineId') or '',
-        'pipeline_stage_id': opp_obj.get('pipelineStageId') or '',
-        'date_added': date_added,
-    }
+    if monetary is not None:
+        try:
+            monetary = int(monetary)  # opportunity_report.monetary_value is BIGINT
+        except (TypeError, ValueError):
+            monetary = None
+    created_date_val = created_at or updated_at
+
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            INSERT INTO opportunity_report (
+                opportunity_id, pipeline_id, pipeline_stage_id, assigned_to,
+                contact_id, location_id, lost_reason_id, opportunity_name,
+                monetary_value, status, source, last_status_change_at,
+                last_stage_change_at, created_at, updated_at, created_date,
+                contact_name, email, phone, company_name
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s
+            )
+            ON CONFLICT (opportunity_id) DO UPDATE SET
+                pipeline_id = EXCLUDED.pipeline_id,
+                pipeline_stage_id = EXCLUDED.pipeline_stage_id,
+                assigned_to = EXCLUDED.assigned_to,
+                contact_id = EXCLUDED.contact_id,
+                location_id = EXCLUDED.location_id,
+                lost_reason_id = EXCLUDED.lost_reason_id,
+                opportunity_name = EXCLUDED.opportunity_name,
+                monetary_value = EXCLUDED.monetary_value,
+                status = EXCLUDED.status,
+                source = EXCLUDED.source,
+                last_status_change_at = EXCLUDED.last_status_change_at,
+                last_stage_change_at = EXCLUDED.last_stage_change_at,
+                created_at = EXCLUDED.created_at,
+                updated_at = EXCLUDED.updated_at,
+                created_date = EXCLUDED.created_date,
+                contact_name = EXCLUDED.contact_name,
+                email = EXCLUDED.email,
+                phone = EXCLUDED.phone,
+                company_name = EXCLUDED.company_name
+        """, [
+            opportunity_id,
+            opp_obj.get('pipelineId') or '',
+            opp_obj.get('pipelineStageId') or '',
+            assigned_to,
+            opp_obj.get('contactId') or '',
+            location.location_id,
+            lost_reason_id,
+            opp_obj.get('name') or '',
+            monetary,
+            opp_obj.get('status') or '',
+            opp_obj.get('source') or '',
+            last_status_change,
+            last_stage_change,
+            created_at,
+            updated_at,
+            created_date_val,
+            contact_name,
+            email,
+            phone_val,
+            company_name,
+        ])
 
 
 def _db_delete_opportunity(opportunity_id: str, max_retries: int = 3):
-    """Delete opportunity from DB (GHLOpportunity and opportunity_report) with retry."""
+    """Delete opportunity from GHLOpportunity and opportunity_report (RDS)."""
     for attempt in range(max_retries):
         try:
             GHLOpportunity.objects.filter(opportunity_id=opportunity_id).delete()
-            OpportunityReport.objects.filter(opportunity_id=opportunity_id).delete()
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM opportunity_report WHERE opportunity_id = %s", [opportunity_id])
             return
         except OperationalError as exc:
             if 'locked' in str(exc).lower() and attempt < max_retries - 1:
@@ -153,7 +215,7 @@ def _db_delete_opportunity(opportunity_id: str, max_retries: int = 3):
 
 
 def _db_update_or_create_opportunity(opportunity_id: str, location: GHLLocation, raw_data: dict, max_retries: int = 3):
-    """Update or create opportunity in DB and opportunity_report table."""
+    """Update or create in GHLOpportunity and upsert into opportunity_report (RDS)."""
     data = raw_data if isinstance(raw_data, dict) else {}
     for attempt in range(max_retries):
         try:
@@ -161,11 +223,7 @@ def _db_update_or_create_opportunity(opportunity_id: str, location: GHLLocation,
                 opportunity_id=opportunity_id,
                 defaults={'location': location, 'raw_data': data},
             )
-            report_data = _extract_opportunity_report_data(opportunity_id, location, data)
-            OpportunityReport.objects.update_or_create(
-                opportunity_id=opportunity_id,
-                defaults=report_data,
-            )
+            _upsert_opportunity_report(opportunity_id, location, data)
             return
         except OperationalError as exc:
             if 'locked' in str(exc).lower() and attempt < max_retries - 1:
