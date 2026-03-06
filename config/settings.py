@@ -37,11 +37,7 @@ SECRET_KEY = config('SECRET_KEY', default='')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DEBUG', default=True)
 
-ALLOWED_HOSTS = [
-    'localhost',
-    '127.0.0.1',
-    'unscavenged-uncalumnious-desmond.ngrok-free.dev',
-]
+ALLOWED_HOSTS = [h.strip() for h in config('ALLOWED_HOSTS', default='localhost,127.0.0.1').split(',') if h.strip()]
 
 
 # Application definition
