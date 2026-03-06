@@ -147,7 +147,28 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 # CORS - allow frontend to call API
-CORS_ALLOW_ALL_ORIGINS = True  # For dev; restrict in production
+# Set CORS_ALLOW_ALL_ORIGINS=True in .env for dev; use CORS_ALLOWED_ORIGINS for production
+CORS_ALLOW_ALL_ORIGINS = config('CORS_ALLOW_ALL_ORIGINS', default='True').lower() in ('true', '1', 'yes')
+CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', default='http://localhost:5173,http://127.0.0.1:5173', cast=Csv())
+CORS_TRUSTED_ORIGINS = [x for x in config('CORS_TRUSTED_ORIGINS', default='', cast=Csv()) if x]
+CORS_ALLOW_CREDENTIALS = config('CORS_ALLOW_CREDENTIALS', default='False').lower() in ('true', '1', 'yes')
+CORS_ALLOW_METHODS = config('CORS_ALLOW_METHODS', default='DELETE,GET,OPTIONS,PATCH,POST,PUT', cast=Csv())
+CORS_ALLOW_HEADERS = config('CORS_ALLOW_HEADERS', default='accept,accept-encoding,authorization,content-type,origin,x-csrftoken,x-requested-with', cast=Csv())
+CORS_PREFLIGHT_MAX_AGE = config('CORS_PREFLIGHT_MAX_AGE', default=86400, cast=int)
+
+# REST Framework
+REST_FRAMEWORK = {
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
+    'DEFAULT_PARSER_CLASSES': [
+        'rest_framework.parsers.JSONParser',
+    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',
+    ],
+}
 
 # Celery (optional - for token refresh and async tasks)
 CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='')
