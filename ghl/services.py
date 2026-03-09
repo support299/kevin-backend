@@ -145,15 +145,43 @@ class GHLClient:
 
     def get_pipelines(self) -> list:
         """
-        Fetch pipelines for this location from GHL API.
+        Fetch pipelines for this location from GHL API (includes stages).
         GET /opportunities/pipelines?locationId={location_id}
-        Returns list of pipeline dicts with 'id' and 'name'.
+        Returns list of pipeline dicts with 'id', 'name', and 'stages' (array of {id, name}).
         """
         path = f"/opportunities/pipelines?locationId={self.location_id}"
         resp = self._request('GET', path)
         # GHL may return { "pipelines": [...] } or { "opportunities": { "pipelines": [...] } }
         pipelines = resp.get('pipelines') or resp.get('opportunities', {}).get('pipelines') or []
         return pipelines if isinstance(pipelines, list) else []
+
+    def get_pipeline_detail(self, pipeline_id: str) -> Optional[dict]:
+        """
+        Fetch single pipeline with stages from GHL API.
+        GET /opportunities/pipelines/{pipelineId}?locationId={location_id}
+        Returns { "id", "name", "stages": [ {"id", "name"} ] } or None if not found.
+        """
+        if not pipeline_id:
+            return None
+        try:
+            path = f"/opportunities/pipelines/{pipeline_id}?locationId={self.location_id}"
+            resp = self._request('GET', path)
+            pipeline = resp.get('pipeline') or resp
+            if not isinstance(pipeline, dict) or not pipeline.get('id'):
+                logger.warning("Pipeline detail response missing pipeline.id: keys=%s", list(resp.keys()) if isinstance(resp, dict) else type(resp))
+                return None
+            stages = pipeline.get('stages') or []
+            return {
+                'id': pipeline.get('id', ''),
+                'name': pipeline.get('name') or pipeline.get('pipelineName') or '',
+                'stages': [
+                    {'id': s.get('id', ''), 'name': s.get('name') or s.get('stageName') or ''}
+                    for s in stages if isinstance(s, dict) and s.get('id')
+                ],
+            }
+        except Exception as e:
+            logger.warning("Failed to fetch pipeline detail %s: %s", pipeline_id, e)
+            return None
 
     def get_hmg_pipeline_id(self) -> Optional[str]:
         """
