@@ -327,42 +327,50 @@ class OpportunityListView(APIView):
 
 class PipelinesListView(APIView):
     """
-    List pipelines for the first active location (for dropdown), including stages.
+    List pipelines for a specific location (for dropdown), including stages.
     GET /api/ghlpage/pipelines/
     Returns [{ "id", "name", "stages": [{ "id", "name" }] }, ...] and default_pipeline_id (HMG).
     """
     permission_classes = [AllowAny]
 
     def get(self, request):
-        location = GHLLocation.objects.filter(status='active').first()
+        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION_ID', 'Gr7A9M5HBop3hB1v2owg')
+        location = GHLLocation.objects.filter(location_id=location_id, status='active').first()
+        
         if not location:
             return Response({'pipelines': [], 'default_pipeline_id': None})
+        
         try:
             client = GHLClient(location_id=location.location_id)
             pipelines = client.get_pipelines()
             result = []
+            hmg_name = (getattr(settings, 'GHL_HMG_PIPELINE_NAME', 'HMG') or '').strip().lower()
+            default_pipeline_id = None
+            
             for p in pipelines:
                 if not isinstance(p, dict) or not p.get('id'):
                     continue
+                
+                pipeline_id = p.get('id', '')
                 stages = p.get('stages') or []
                 stage_list = [
                     {'id': s.get('id', ''), 'name': s.get('name') or s.get('stageName') or ''}
                     for s in stages if isinstance(s, dict) and s.get('id')
                 ]
                 result.append({
-                    'id': p.get('id', ''),
+                    'id': pipeline_id,
                     'name': p.get('name') or p.get('pipelineName') or '',
                     'stages': stage_list,
                 })
-            hmg_name = (getattr(settings, 'GHL_HMG_PIPELINE_NAME', 'HMG') or '').strip().lower()
-            default_pipeline_id = None
-            if hmg_name:
-                for p in pipelines:
-                    if isinstance(p, dict) and (p.get('name') or '').strip().lower() == hmg_name:
-                        default_pipeline_id = p.get('id')
-                        break
+                
+                if hmg_name and not default_pipeline_id:
+                    if (p.get('name') or '').strip().lower() == hmg_name:
+                        default_pipeline_id = pipeline_id
+
             return Response({'pipelines': result, 'default_pipeline_id': default_pipeline_id})
-        except Exception:
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch pipelines for location {location.location_id}: {e}")
             return Response({'pipelines': [], 'default_pipeline_id': None})
 
 
