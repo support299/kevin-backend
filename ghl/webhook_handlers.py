@@ -1,7 +1,13 @@
 """
 Webhook handlers for GHL opportunity sync (GHL → our DB only).
-Syncs opportunities from all pipelines.
+Syncs opportunities from allowed pipelines only (v2026 is blocked).
 """
+
+# Pipeline IDs that should NOT be synced or stored in our DB.
+# Add any pipeline ID here to block it from future syncing.
+BLOCKED_PIPELINE_IDS = {
+    'VEA9ftw4r48zYwhq4ltL',  # v2026 pipeline
+}
 import logging
 import time
 
@@ -43,7 +49,8 @@ def _handle_opportunity_delete(location_id: str, opportunity_id: str):
 
 def _fetch_and_store_opportunity(location_id: str, opportunity_id: str):
     """
-    Fetch full opportunity from GHL API and upsert to GHLOpportunity (all pipelines).
+    Fetch full opportunity from GHL API and upsert to GHLOpportunity (allowed pipelines only).
+    Skips any opportunity belonging to a pipeline listed in BLOCKED_PIPELINE_IDS.
     """
     try:
         location = GHLLocation.objects.get(location_id=location_id, status='active')
@@ -57,6 +64,17 @@ def _fetch_and_store_opportunity(location_id: str, opportunity_id: str):
     except Exception as exc:
         logger.error("GHL API error fetching opportunity %s: %s", opportunity_id, exc)
         raise
+
+    # Extract the pipeline ID from the fetched opportunity and check if it is blocked
+    data = full_opportunity if isinstance(full_opportunity, dict) else {}
+    opp_obj = data.get('opportunity') if isinstance(data.get('opportunity'), dict) else data
+    pipeline_id = opp_obj.get('pipelineId') or ''
+    if pipeline_id in BLOCKED_PIPELINE_IDS:
+        logger.info(
+            "Skipping opportunity %s - pipeline %s is blocked from syncing",
+            opportunity_id, pipeline_id
+        )
+        return
 
     _db_update_or_create_opportunity(opportunity_id, location, full_opportunity)
     logger.info("Stored opportunity %s for location %s", opportunity_id, location_id)
