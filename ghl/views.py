@@ -701,9 +701,12 @@ class GHLWebhookView(APIView):
                         location_id=location_id,
                         contact_id=entity_id,
                     )
+                    print(f"[CONTACT ] Queued via Celery OK")
                 else:
-                    raise ImportError("Task not available")
-            except Exception:
+                    raise ImportError("Celery task not registered")
+            except Exception as e:
+                print(f"[CONTACT ] Celery unavailable ({type(e).__name__}: {e}), running synchronously")
+                logger.warning("Contact Celery fallback for %s: %s", entity_id, e)
                 from .webhook_handlers import process_contact_webhook
                 process_contact_webhook(event_type, location_id, entity_id)
 
@@ -718,9 +721,12 @@ class GHLWebhookView(APIView):
                         location_id=location_id,
                         opportunity_id=entity_id,
                     )
+                    print(f"[OPPORTUNITY] Queued via Celery OK")
                 else:
-                    raise ImportError("Task not available")
-            except Exception:
+                    raise ImportError("Celery task not registered")
+            except Exception as e:
+                print(f"[OPPORTUNITY] Celery unavailable ({type(e).__name__}: {e}), running synchronously")
+                logger.warning("Opportunity Celery fallback for %s: %s", entity_id, e)
                 from .webhook_handlers import process_opportunity_webhook
                 process_opportunity_webhook(event_type, location_id, entity_id)
 
