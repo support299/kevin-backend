@@ -36,7 +36,7 @@ def _row_to_opportunity_dict(row, columns):
     return {
         'id': d.get('opportunity_id') or '',
         'location_id': d.get('location_id') or '',
-        'location_name': d.get('location_id') or '',  # opportunity_report has no location_name
+        'location_name': d.get('location_id') or '',
         'contact_name': d.get('contact_name') or '-',
         'contact_email': d.get('email') or '-',
         'contact_phone': d.get('phone') or '-',
@@ -47,13 +47,13 @@ def _row_to_opportunity_dict(row, columns):
         'contact_id': d.get('contact_id') or '',
         'pipeline_id': d.get('pipeline_id') or '',
         'pipeline_stage_id': d.get('pipeline_stage_id') or '',
-        'pipeline_name': '',  # filled by _enrich_opportunities_with_pipeline_stage_names
-        'pipeline_stage_name': '',
+        'pipeline_name': d.get('pipeline_name') or '',       # read directly from DB
+        'pipeline_stage_name': d.get('pipeline_stage_name') or '',  # read directly from DB
         'assigned_to': d.get('assigned_to') or '',
         'source': d.get('source') or '',
         'date_added': d.get('created_at').isoformat() if d.get('created_at') else None,
         'updated_at': d.get('updated_at').isoformat() if d.get('updated_at') else None,
-        'raw_data': {},  # opportunity_report has no raw JSON
+        'raw_data': {},
     }
 
 
@@ -175,10 +175,10 @@ def _fetch_from_opportunity_report(page, page_size, search, pipeline_id=None, pi
     """Fetch opportunities from opportunity_report table (PostgreSQL)."""
     import re
     cols = [
-        'opportunity_id', 'pipeline_id', 'pipeline_stage_id', 'assigned_to', 'contact_id',
-        'location_id', 'lost_reason_id', 'opportunity_name', 'monetary_value', 'status', 'source',
-        'last_status_change_at', 'last_stage_change_at', 'created_at', 'updated_at',
-        'contact_name', 'email', 'phone', 'company_name'
+        'opportunity_id', 'pipeline_id', 'pipeline_stage_id', 'pipeline_name', 'pipeline_stage_name',
+        'assigned_to', 'contact_id', 'location_id', 'lost_reason_id', 'opportunity_name',
+        'monetary_value', 'status', 'source', 'last_status_change_at', 'last_stage_change_at',
+        'created_at', 'updated_at', 'contact_name', 'email', 'phone', 'company_name'
     ]
     col_list = ', '.join(cols)
     base_where = []
@@ -310,7 +310,8 @@ class OpportunityListView(APIView):
                 page_obj = paginator.get_page(page)
                 data = [_serialize_opportunity(opp) for opp in page_obj]
 
-        _enrich_opportunities_with_pipeline_stage_names(data)
+        # pipeline_name and pipeline_stage_name are already stored in the DB rows
+        # No GHL API call needed
 
         total_pages = max(1, (total_count + page_size - 1) // page_size)
         if search:
@@ -327,50 +328,59 @@ class OpportunityListView(APIView):
 
 class PipelinesListView(APIView):
     """
-    List pipelines for a specific location (for dropdown), including stages.
+    List distinct pipelines and their stages from the opportunity_report table.
+    No GHL API call — reads pipeline_name, pipeline_stage_name directly from DB.
     GET /api/ghlpage/pipelines/
     Returns [{ "id", "name", "stages": [{ "id", "name" }] }, ...] and default_pipeline_id (HMG).
     """
     permission_classes = [AllowAny]
 
     def get(self, request):
-        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION_ID', 'Gr7A9M5HBop3hB1v2owg')
-        location = GHLLocation.objects.filter(location_id=location_id, status='active').first()
-        
-        if not location:
-            return Response({'pipelines': [], 'default_pipeline_id': None})
-        
         try:
-            client = GHLClient(location_id=location.location_id)
-            pipelines = client.get_pipelines()
-            result = []
+            # Fetch all distinct (pipeline_id, pipeline_name, pipeline_stage_id, pipeline_stage_name)
+            # combinations that actually exist in the DB
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT DISTINCT
+                        pipeline_id,
+                        COALESCE(NULLIF(pipeline_name, ''), pipeline_id)  AS pipeline_name,
+                        pipeline_stage_id,
+                        COALESCE(NULLIF(pipeline_stage_name, ''), pipeline_stage_id) AS pipeline_stage_name
+                    FROM opportunity_report
+                    WHERE pipeline_id IS NOT NULL AND pipeline_id <> ''
+                    ORDER BY pipeline_id, pipeline_stage_id
+                """)
+                rows = cursor.fetchall()
+
+            # Group stages under each pipeline
+            pipelines_dict = {}
+            for pipeline_id, pipeline_name, stage_id, stage_name in rows:
+                if pipeline_id not in pipelines_dict:
+                    pipelines_dict[pipeline_id] = {
+                        'id': pipeline_id,
+                        'name': pipeline_name,
+                        'stages': [],
+                    }
+                if stage_id:  # some rows may have no stage
+                    pipelines_dict[pipeline_id]['stages'].append({
+                        'id': stage_id,
+                        'name': stage_name,
+                    })
+
+            result = list(pipelines_dict.values())
+
+            # Find HMG pipeline as the default
             hmg_name = (getattr(settings, 'GHL_HMG_PIPELINE_NAME', 'HMG') or '').strip().lower()
             default_pipeline_id = None
-            
-            for p in pipelines:
-                if not isinstance(p, dict) or not p.get('id'):
-                    continue
-                
-                pipeline_id = p.get('id', '')
-                stages = p.get('stages') or []
-                stage_list = [
-                    {'id': s.get('id', ''), 'name': s.get('name') or s.get('stageName') or ''}
-                    for s in stages if isinstance(s, dict) and s.get('id')
-                ]
-                result.append({
-                    'id': pipeline_id,
-                    'name': p.get('name') or p.get('pipelineName') or '',
-                    'stages': stage_list,
-                })
-                
-                if hmg_name and not default_pipeline_id:
-                    if (p.get('name') or '').strip().lower() == hmg_name:
-                        default_pipeline_id = pipeline_id
+            for p in result:
+                if hmg_name and (p.get('name') or '').strip().lower() == hmg_name:
+                    default_pipeline_id = p['id']
+                    break
 
             return Response({'pipelines': result, 'default_pipeline_id': default_pipeline_id})
 
         except Exception as e:
-            logger.warning(f"Failed to fetch pipelines for location {location.location_id}: {e}")
+            logger.warning("Failed to fetch pipelines from DB: %s", e)
             return Response({'pipelines': [], 'default_pipeline_id': None})
 
 
