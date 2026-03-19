@@ -121,6 +121,28 @@ class GHLClient:
                 body = resp.read().decode('utf-8')
                 return json.loads(body) if body else {}
 
+    def get_contact(self, contact_id: str) -> dict:
+        """
+        Fetch full contact from GHL API.
+        GET /contacts/{contactId}
+        """
+        path = f"/contacts/{contact_id}"
+        return self._request('GET', path)
+
+    def get_contact_or_none(self, contact_id: str):
+        """
+        Fetch contact from GHL API. Returns None if not found (404).
+        Raises for other errors (auth, network, etc.).
+        """
+        try:
+            return self.get_contact(contact_id)
+        except Exception as exc:
+            if getattr(exc, 'response', None) and getattr(exc.response, 'status_code', None) == 404:
+                return None
+            if getattr(exc, 'code', None) == 404:
+                return None
+            raise
+
     def get_opportunity(self, opportunity_id: str) -> dict:
         """
         Fetch full opportunity from GHL API.

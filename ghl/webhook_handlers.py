@@ -211,3 +211,202 @@ def _db_update_or_create_opportunity(opportunity_id: str, location: GHLLocation,
                 time.sleep(0.3 * (attempt + 1))
             else:
                 raise
+
+
+# ---------------------------------------------------------------------------
+# Contact webhook handlers
+# ---------------------------------------------------------------------------
+
+def process_contact_webhook(event_type: str, location_id: str, contact_id: str):
+    """
+    Process contact webhook: fetch from GHL then upsert or delete in contact_report.
+    Supported event types: ContactCreate, ContactUpdate, ContactDelete
+    """
+    if event_type == 'ContactDelete':
+        _handle_contact_delete(location_id, contact_id)
+    elif event_type in ('ContactCreate', 'ContactUpdate', 'ContactAdded'):
+        _fetch_and_store_contact(location_id, contact_id)
+    else:
+        logger.debug("Unrecognized contact event_type=%s for contact %s", event_type, contact_id)
+
+
+def _handle_contact_delete(location_id: str, contact_id: str):
+    """On delete: remove contact from contact_report if it exists."""
+    try:
+        GHLLocation.objects.get(location_id=location_id, status='active')
+    except GHLLocation.DoesNotExist:
+        logger.warning("Location %s not found or inactive, skipping contact delete", location_id)
+        return
+
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM contact_report WHERE id = %s", [contact_id])
+    logger.info("Deleted contact %s from contact_report", contact_id)
+
+
+def _fetch_and_store_contact(location_id: str, contact_id: str):
+    """Fetch full contact from GHL API and upsert into contact_report."""
+    try:
+        location = GHLLocation.objects.get(location_id=location_id, status='active')
+    except GHLLocation.DoesNotExist:
+        logger.warning("Location %s not found or inactive, skipping contact fetch", location_id)
+        return
+
+    client = GHLClient(location_id=location_id)
+    try:
+        full_contact = client.get_contact(contact_id)
+    except Exception as exc:
+        logger.error("GHL API error fetching contact %s: %s", contact_id, exc)
+        raise
+
+    _upsert_contact_report(contact_id, location, full_contact)
+    logger.info("Stored contact %s for location %s", contact_id, location_id)
+
+
+def _parse_date(val):
+    """Parse a date string (various formats) into a date object, or return None."""
+    if not val:
+        return None
+    try:
+        from django.utils.dateparse import parse_date, parse_datetime
+        if isinstance(val, str):
+            # Try date first, then datetime
+            d = parse_date(val[:10])  # take first 10 chars covers YYYY-MM-DD
+            if d:
+                return d
+            dt = parse_datetime(val)
+            return dt.date() if dt else None
+        return val
+    except (TypeError, ValueError):
+        return None
+
+
+def _upsert_contact_report(contact_id: str, location: GHLLocation, raw_data: dict):
+    """
+    Upsert into contact_report table using raw GHL API contact response.
+    GHL GET /contacts/{id} returns { "contact": { ... } }.
+    """
+    data = raw_data if isinstance(raw_data, dict) else {}
+    # GHL wraps the contact under "contact" key
+    c = data.get('contact') if isinstance(data.get('contact'), dict) else data
+
+    # Basic fields
+    first_name = (c.get('firstName') or '')[:500]
+    last_name  = (c.get('lastName') or '')[:500]
+    contact_name = (c.get('contactName') or c.get('name') or f"{first_name} {last_name}".strip())[:500]
+    email      = (c.get('email') or '')[:500]
+    phone      = (c.get('phone') or '')[:100]
+
+    # Phone label from additionalPhones[0].label if available
+    phones_raw = c.get('phones') or c.get('additionalPhones') or []
+    phone_label = ''
+    if phones_raw and isinstance(phones_raw[0], dict):
+        phone_label = (phones_raw[0].get('label') or '')[:100]
+
+    company_name  = (c.get('companyName') or '')[:500]
+    business_id   = (c.get('businessId') or '')[:255]
+    business_name = (c.get('businessName') or '')[:500]
+    address       = (c.get('address1') or '')[:1000]
+    city          = (c.get('city') or '')[:255]
+    state         = (c.get('state') or '')[:255]
+    country       = (c.get('country') or '')[:255]
+    postal_code   = (c.get('postalCode') or '')[:50]
+    website       = (c.get('website') or '')[:500]
+    tz            = (c.get('timezone') or '')[:100]
+    source        = (c.get('source') or '')[:500]
+    contact_type  = (c.get('type') or '')[:100]
+    valid_email   = c.get('validEmail')
+    dnd           = c.get('dnd')
+    assigned_to   = (c.get('assignedTo') or '')[:255]
+
+    date_added   = _parse_date(c.get('dateAdded'))
+    date_updated = _parse_date(c.get('dateUpdated'))
+    date_of_birth = _parse_date(c.get('dateOfBirth'))
+
+    import json as json_lib
+    def _as_json(val):
+        """Convert value to JSON string for JSONB columns, or None if empty."""
+        if val is None:
+            return None
+        if isinstance(val, (dict, list)):
+            return json_lib.dumps(val)
+        return str(val)
+
+    additional_emails       = _as_json(c.get('additionalEmails') or c.get('emails'))
+    additional_phones       = _as_json(phones_raw)
+    tags                    = _as_json(c.get('tags'))
+    custom_fields           = _as_json(c.get('customFields'))
+    dnd_settings            = _as_json(c.get('dndSettings'))
+    inbound_dnd_settings    = _as_json(c.get('inboundDndSettings'))
+    followers               = _as_json(c.get('followers'))
+    opportunities           = _as_json(c.get('opportunities'))
+    attribution_source      = _as_json(c.get('attributionSource'))
+    last_attribution_source = _as_json(c.get('lastAttributionSource'))
+
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            INSERT INTO contact_report (
+                id, location_id, first_name, last_name, contact_name,
+                email, phone, phone_label, company_name, business_id, business_name,
+                address, city, state, country, postal_code, website, timezone,
+                date_added, date_updated, date_of_birth, source, type,
+                valid_email, dnd, assigned_to,
+                additional_emails, additional_phones, tags, custom_fields,
+                dnd_settings, inbound_dnd_settings, followers, opportunities,
+                attribution_source, last_attribution_source
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                location_id             = EXCLUDED.location_id,
+                first_name              = EXCLUDED.first_name,
+                last_name               = EXCLUDED.last_name,
+                contact_name            = EXCLUDED.contact_name,
+                email                   = EXCLUDED.email,
+                phone                   = EXCLUDED.phone,
+                phone_label             = EXCLUDED.phone_label,
+                company_name            = EXCLUDED.company_name,
+                business_id             = EXCLUDED.business_id,
+                business_name           = EXCLUDED.business_name,
+                address                 = EXCLUDED.address,
+                city                    = EXCLUDED.city,
+                state                   = EXCLUDED.state,
+                country                 = EXCLUDED.country,
+                postal_code             = EXCLUDED.postal_code,
+                website                 = EXCLUDED.website,
+                timezone                = EXCLUDED.timezone,
+                date_added              = EXCLUDED.date_added,
+                date_updated            = EXCLUDED.date_updated,
+                date_of_birth           = EXCLUDED.date_of_birth,
+                source                  = EXCLUDED.source,
+                type                    = EXCLUDED.type,
+                valid_email             = EXCLUDED.valid_email,
+                dnd                     = EXCLUDED.dnd,
+                assigned_to             = EXCLUDED.assigned_to,
+                additional_emails       = EXCLUDED.additional_emails,
+                additional_phones       = EXCLUDED.additional_phones,
+                tags                    = EXCLUDED.tags,
+                custom_fields           = EXCLUDED.custom_fields,
+                dnd_settings            = EXCLUDED.dnd_settings,
+                inbound_dnd_settings    = EXCLUDED.inbound_dnd_settings,
+                followers               = EXCLUDED.followers,
+                opportunities           = EXCLUDED.opportunities,
+                attribution_source      = EXCLUDED.attribution_source,
+                last_attribution_source = EXCLUDED.last_attribution_source
+        """, [
+            contact_id, location.location_id, first_name, last_name, contact_name,
+            email, phone, phone_label, company_name, business_id, business_name,
+            address, city, state, country, postal_code, website, tz,
+            date_added, date_updated, date_of_birth, source, contact_type,
+            valid_email, dnd, assigned_to,
+            additional_emails, additional_phones, tags, custom_fields,
+            dnd_settings, inbound_dnd_settings, followers, opportunities,
+            attribution_source, last_attribution_source,
+        ])
+

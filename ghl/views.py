@@ -658,47 +658,124 @@ class GHLOAuthCallbackView(APIView):
 @method_decorator(csrf_exempt, name='dispatch')
 class GHLWebhookView(APIView):
     """
-    Webhook endpoint for GHL opportunity events (OpportunityUpdate, OpportunityDelete, OpportunityCreate).
-    Sync flow: GHL → our DB only (one-way).
-    - Create/Update: fetch full opportunity from GHL, then upsert to DB.
-    - Delete: try to fetch from GHL; if we can't fetch (404), delete from our DB.
+    Single webhook endpoint for ALL GHL events (opportunities AND contacts).
+    GHL sends every event type to this one registered URL.
+    Sync flow: GHL -> our DB only (one-way).
     POST /api/ghlpage/webhooks/opportunity/
     """
     permission_classes = [AllowAny]
 
+    # Event types that belong to contacts
+    CONTACT_EVENT_TYPES = {'ContactCreate', 'ContactUpdate', 'ContactDelete', 'ContactAdded'}
+    # Event types that belong to opportunities
+    OPPORTUNITY_EVENT_TYPES = {'OpportunityCreate', 'OpportunityUpdate', 'OpportunityDelete', 'OpportunityAdded'}
+
     def post(self, request):
+        import json as json_lib
         data = request.data if hasattr(request, 'data') else {}
         if not data and request.body:
             try:
-                import json
-                data = json.loads(request.body)
+                data = json_lib.loads(request.body)
             except Exception:
                 return Response({"error": "Invalid JSON"}, status=status.HTTP_400_BAD_REQUEST)
 
-        print("Webhook payload:", data)
+        event_type = data.get('type', '')
+        location_id = data.get('locationId')
+        entity_id = data.get('id')
+
+        logger.info("Webhook received: type=%s id=%s location=%s", event_type, entity_id, location_id)
+        print(f"[WEBHOOK] type={event_type} | id={entity_id} | location={location_id}")
+
+        if not entity_id or not location_id:
+            logger.warning("Webhook missing id or locationId: %s", data)
+            return Response({"received": True}, status=status.HTTP_200_OK)
+
+        if event_type in self.CONTACT_EVENT_TYPES:
+            print(f"[CONTACT ] {event_type} -> contact_id={entity_id}")
+            # Route to contact handler
+            try:
+                from .tasks import process_contact_webhook_task
+                if process_contact_webhook_task:
+                    process_contact_webhook_task.delay(
+                        event_type=event_type,
+                        location_id=location_id,
+                        contact_id=entity_id,
+                    )
+                else:
+                    raise ImportError("Task not available")
+            except Exception:
+                from .webhook_handlers import process_contact_webhook
+                process_contact_webhook(event_type, location_id, entity_id)
+
+        elif event_type in self.OPPORTUNITY_EVENT_TYPES:
+            print(f"[OPPORTUNITY] {event_type} -> opportunity_id={entity_id}")
+            # Route to opportunity handler
+            try:
+                from .tasks import process_opportunity_webhook_task
+                if process_opportunity_webhook_task:
+                    process_opportunity_webhook_task.delay(
+                        event_type=event_type,
+                        location_id=location_id,
+                        opportunity_id=entity_id,
+                    )
+                else:
+                    raise ImportError("Task not available")
+            except Exception:
+                from .webhook_handlers import process_opportunity_webhook
+                process_opportunity_webhook(event_type, location_id, entity_id)
+
+        else:
+            print(f"[WEBHOOK ] Unhandled event_type={event_type!r}, ignoring.")
+            logger.debug("Unhandled webhook event_type=%s, ignoring.", event_type)
+
+        return Response({"received": True}, status=status.HTTP_200_OK)
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class GHLContactWebhookView(APIView):
+    """
+    Webhook endpoint for GHL contact events (ContactCreate, ContactUpdate, ContactDelete).
+    Sync flow: GHL → our DB only (one-way).
+    - Create/Update: fetch full contact from GHL API, then upsert into contact_report.
+    - Delete: remove from contact_report.
+    POST /api/ghlpage/webhooks/contact/
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        import json as json_lib
+        data = request.data if hasattr(request, 'data') else {}
+        if not data and request.body:
+            try:
+                data = json_lib.loads(request.body)
+            except Exception:
+                return Response({"error": "Invalid JSON"}, status=status.HTTP_400_BAD_REQUEST)
+
+        logger.info("Contact webhook payload: %s", data)
 
         event_type = data.get('type', '')
         location_id = data.get('locationId')
-        opportunity_id = data.get('id')
+        contact_id = data.get('id')
 
-        if not opportunity_id or not location_id:
-            logger.warning("Webhook missing opportunity id or locationId: %s", data)
+        if not contact_id or not location_id:
+            logger.warning("Contact webhook missing id or locationId: %s", data)
             return Response({"received": True}, status=status.HTTP_200_OK)
 
-        # Offload to Celery if available (avoids SQLite DB locks on burst webhooks)
+        # Offload to Celery if available
         try:
-            from .tasks import process_opportunity_webhook_task
-            if process_opportunity_webhook_task:
-                process_opportunity_webhook_task.delay(
+            from .tasks import process_contact_webhook_task
+            if process_contact_webhook_task:
+                process_contact_webhook_task.delay(
                     event_type=event_type,
                     location_id=location_id,
-                    opportunity_id=opportunity_id,
+                    contact_id=contact_id,
                 )
             else:
                 raise ImportError("Task not available")
         except Exception:
             # Celery not available or Redis down: process synchronously
-            from .webhook_handlers import process_opportunity_webhook
-            process_opportunity_webhook(event_type, location_id, opportunity_id)
+            from .webhook_handlers import process_contact_webhook
+            process_contact_webhook(event_type, location_id, contact_id)
 
         return Response({"received": True}, status=status.HTTP_200_OK)
+

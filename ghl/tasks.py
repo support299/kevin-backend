@@ -93,6 +93,24 @@ try:
                 event_type, opportunity_id, exc, exc_info=True
             )
             raise
+
+    @shared_task
+    def process_contact_webhook_task(event_type: str, location_id: str, contact_id: str):
+        """
+        Process contact webhook in background (avoids DB locks on burst).
+        """
+        from .webhook_handlers import process_contact_webhook
+        try:
+            process_contact_webhook(event_type, location_id, contact_id)
+        except Exception as exc:
+            logger.error(
+                "Failed to process contact webhook %s for %s: %s",
+                event_type, contact_id, exc, exc_info=True
+            )
+            raise
+
 except ImportError:
     refresh_ghl_tokens = None
     process_opportunity_webhook_task = None
+    process_contact_webhook_task = None
+
