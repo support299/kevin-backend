@@ -7,6 +7,7 @@ Syncs opportunities from allowed pipelines only (v2026 is blocked).
 # Add any pipeline ID here to block it from future syncing.
 BLOCKED_PIPELINE_IDS = {
     'VEA9ftw4r48zYwhq4ltL',  # v2026 pipeline
+    '2Dw2997c3HrCqtKGvd28',  # blocked pipeline
 }
 import logging
 import time
@@ -91,10 +92,80 @@ def _parse_dt(val):
         return None
 
 
+def _resolve_pipeline_stage_names(location_id: str, pipeline_id: str, pipeline_stage_id: str):
+    """
+    Resolve human-readable pipeline_name and pipeline_stage_name.
+
+    Strategy (cheapest first):
+      1. Look up from existing rows in opportunity_report that already have names.
+      2. If still unknown, call GHL GET /opportunities/pipelines?locationId= API.
+
+    Returns: (pipeline_name, pipeline_stage_name) as strings.
+    """
+    pipeline_name = ''
+    pipeline_stage_name = ''
+
+    if not pipeline_id:
+        return pipeline_name, pipeline_stage_name
+
+    # --- Step 1: Try the DB first (zero extra API calls for known pipelines) ---
+    try:
+        with connection.cursor() as cursor:
+            # Find pipeline name
+            cursor.execute("""
+                SELECT pipeline_name
+                FROM opportunity_report
+                WHERE pipeline_id = %s
+                  AND pipeline_name IS NOT NULL AND pipeline_name <> ''
+                LIMIT 1
+            """, [pipeline_id])
+            row = cursor.fetchone()
+            if row:
+                pipeline_name = row[0]
+
+            # Find stage name
+            if pipeline_stage_id:
+                cursor.execute("""
+                    SELECT pipeline_stage_name
+                    FROM opportunity_report
+                    WHERE pipeline_stage_id = %s
+                      AND pipeline_stage_name IS NOT NULL AND pipeline_stage_name <> ''
+                    LIMIT 1
+                """, [pipeline_stage_id])
+                row = cursor.fetchone()
+                if row:
+                    pipeline_stage_name = row[0]
+    except Exception as e:
+        logger.warning("DB name lookup failed for pipeline %s: %s", pipeline_id, e)
+
+    # Both found from DB — no API call needed
+    if pipeline_name and (pipeline_stage_name or not pipeline_stage_id):
+        return pipeline_name, pipeline_stage_name
+
+    # --- Step 2: Fall back to GHL pipelines API ---
+    try:
+        client = GHLClient(location_id=location_id)
+        pipelines = client.get_pipelines()
+        for p in pipelines:
+            if not isinstance(p, dict) or p.get('id') != pipeline_id:
+                continue
+            pipeline_name = p.get('name') or p.get('pipelineName') or pipeline_name
+            for stage in (p.get('stages') or []):
+                if isinstance(stage, dict) and stage.get('id') == pipeline_stage_id:
+                    pipeline_stage_name = stage.get('name') or stage.get('stageName') or pipeline_stage_name
+                    break
+            break
+    except Exception as e:
+        logger.warning("GHL pipelines API fallback failed for location %s pipeline %s: %s",
+                       location_id, pipeline_id, e)
+
+    return pipeline_name, pipeline_stage_name
+
+
 def _upsert_opportunity_report(opportunity_id: str, location: GHLLocation, raw_data: dict):
     """
     Upsert into existing opportunity_report table (RDS) without altering it.
-    Maps GHL opportunity data to matching columns.
+    Maps GHL opportunity data to matching columns, including pipeline_name and pipeline_stage_name.
     """
     data = raw_data if isinstance(raw_data, dict) else {}
     opp_obj = data.get('opportunity') if isinstance(data.get('opportunity'), dict) else data
@@ -119,26 +190,39 @@ def _upsert_opportunity_report(opportunity_id: str, location: GHLLocation, raw_d
     monetary = opp_obj.get('monetaryValue')
     if monetary is not None:
         try:
-            monetary = int(monetary)  # opportunity_report.monetary_value is BIGINT
+            monetary = int(monetary)
         except (TypeError, ValueError):
             monetary = None
     created_date_val = created_at or updated_at
 
+    pipe_id = opp_obj.get('pipelineId') or ''
+    stage_id = opp_obj.get('pipelineStageId') or ''
+
+    # Resolve human-readable names (DB lookup first, GHL API as fallback)
+    pipeline_name, pipeline_stage_name = _resolve_pipeline_stage_names(
+        location.location_id, pipe_id, stage_id
+    )
+
     with connection.cursor() as cursor:
         cursor.execute("""
             INSERT INTO opportunity_report (
-                opportunity_id, pipeline_id, pipeline_stage_id, assigned_to,
-                contact_id, location_id, lost_reason_id, opportunity_name,
+                opportunity_id, pipeline_id, pipeline_stage_id, pipeline_name, pipeline_stage_name,
+                assigned_to, contact_id, location_id, lost_reason_id, opportunity_name,
                 monetary_value, status, source, last_status_change_at,
                 last_stage_change_at, created_at, updated_at, created_date,
                 contact_name, email, phone, company_name
             ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s, %s, %s,
                 %s, %s, %s, %s
             )
             ON CONFLICT (opportunity_id) DO UPDATE SET
                 pipeline_id = EXCLUDED.pipeline_id,
                 pipeline_stage_id = EXCLUDED.pipeline_stage_id,
+                pipeline_name = EXCLUDED.pipeline_name,
+                pipeline_stage_name = EXCLUDED.pipeline_stage_name,
                 assigned_to = EXCLUDED.assigned_to,
                 contact_id = EXCLUDED.contact_id,
                 location_id = EXCLUDED.location_id,
@@ -158,8 +242,10 @@ def _upsert_opportunity_report(opportunity_id: str, location: GHLLocation, raw_d
                 company_name = EXCLUDED.company_name
         """, [
             opportunity_id,
-            opp_obj.get('pipelineId') or '',
-            opp_obj.get('pipelineStageId') or '',
+            pipe_id,
+            stage_id,
+            pipeline_name,
+            pipeline_stage_name,
             assigned_to,
             opp_obj.get('contactId') or '',
             location.location_id,
