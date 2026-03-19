@@ -92,13 +92,71 @@ def _parse_dt(val):
         return None
 
 
+# ---------------------------------------------------------------------------
+# In-memory cache for GHL pipeline/stage names.
+# Key: location_id  →  Value: { 'pipeline_names': {pipe_id: name},
+#                               'stage_names': {stage_id: name},
+#                               'fetched_at': datetime }
+# Refreshed every PIPELINE_CACHE_TTL_SECONDS seconds.
+# ---------------------------------------------------------------------------
+import threading as _threading
+_pipeline_cache: dict = {}
+_pipeline_cache_lock = _threading.Lock()
+PIPELINE_CACHE_TTL_SECONDS = 1800  # 30 minutes
+
+
+def _get_pipeline_maps(location_id: str):
+    """
+    Return (pipeline_names, stage_names) dicts for the given location.
+    Served from in-memory cache; refreshes from GHL API when stale (>30 min).
+    pipeline_names : { pipeline_id -> pipeline_name }
+    stage_names    : { stage_id    -> stage_name    }
+    """
+    import datetime
+    with _pipeline_cache_lock:
+        cached = _pipeline_cache.get(location_id)
+        if cached:
+            age = (datetime.datetime.utcnow() - cached['fetched_at']).total_seconds()
+            if age < PIPELINE_CACHE_TTL_SECONDS:
+                return cached['pipeline_names'], cached['stage_names']
+
+    # Cache miss or expired → fetch from GHL API
+    pipeline_names = {}
+    stage_names = {}
+    try:
+        client = GHLClient(location_id=location_id)
+        pipelines = client.get_pipelines()
+        for p in pipelines:
+            if not isinstance(p, dict) or not p.get('id'):
+                continue
+            pipe_id = p['id']
+            pipeline_names[pipe_id] = p.get('name') or p.get('pipelineName') or pipe_id
+            for stage in (p.get('stages') or []):
+                if isinstance(stage, dict) and stage.get('id'):
+                    sid = stage['id']
+                    stage_names[sid] = stage.get('name') or stage.get('stageName') or sid
+        logger.info("Pipeline cache refreshed for location %s: %d pipelines, %d stages",
+                    location_id, len(pipeline_names), len(stage_names))
+    except Exception as e:
+        logger.warning("GHL pipelines API fetch failed for location %s: %s — will use DB fallback", location_id, e)
+
+    import datetime
+    with _pipeline_cache_lock:
+        _pipeline_cache[location_id] = {
+            'pipeline_names': pipeline_names,
+            'stage_names': stage_names,
+            'fetched_at': datetime.datetime.utcnow(),
+        }
+    return pipeline_names, stage_names
+
+
 def _resolve_pipeline_stage_names(location_id: str, pipeline_id: str, pipeline_stage_id: str):
     """
     Resolve human-readable pipeline_name and pipeline_stage_name.
 
-    Strategy (cheapest first):
-      1. Look up from existing rows in opportunity_report that already have names.
-      2. If still unknown, call GHL GET /opportunities/pipelines?locationId= API.
+    Strategy:
+      1. GHL pipelines API (via 30-min in-memory cache) — always current.
+      2. If GHL unreachable, fall back to existing DB rows.
 
     Returns: (pipeline_name, pipeline_stage_name) as strings.
     """
@@ -108,56 +166,46 @@ def _resolve_pipeline_stage_names(location_id: str, pipeline_id: str, pipeline_s
     if not pipeline_id:
         return pipeline_name, pipeline_stage_name
 
-    # --- Step 1: Try the DB first (zero extra API calls for known pipelines) ---
+    # --- Step 1: GHL API (cached, always current) ---
+    try:
+        pipeline_names, stage_names = _get_pipeline_maps(location_id)
+        pipeline_name = pipeline_names.get(pipeline_id, '')
+        pipeline_stage_name = stage_names.get(pipeline_stage_id, '') if pipeline_stage_id else ''
+    except Exception as e:
+        logger.warning("Pipeline cache lookup failed: %s", e)
+
+    # Both resolved from GHL cache — done
+    if pipeline_name and (pipeline_stage_name or not pipeline_stage_id):
+        return pipeline_name, pipeline_stage_name
+
+    # --- Step 2: DB fallback (GHL was unreachable) ---
     try:
         with connection.cursor() as cursor:
-            # Find pipeline name
-            cursor.execute("""
-                SELECT pipeline_name
-                FROM opportunity_report
-                WHERE pipeline_id = %s
-                  AND pipeline_name IS NOT NULL AND pipeline_name <> ''
-                LIMIT 1
-            """, [pipeline_id])
-            row = cursor.fetchone()
-            if row:
-                pipeline_name = row[0]
-
-            # Find stage name
-            if pipeline_stage_id:
+            if not pipeline_name:
                 cursor.execute("""
-                    SELECT pipeline_stage_name
-                    FROM opportunity_report
+                    SELECT pipeline_name FROM opportunity_report
+                    WHERE pipeline_id = %s
+                      AND pipeline_name IS NOT NULL AND pipeline_name <> ''
+                      AND pipeline_name <> pipeline_id
+                    LIMIT 1
+                """, [pipeline_id])
+                row = cursor.fetchone()
+                if row:
+                    pipeline_name = row[0]
+
+            if pipeline_stage_id and not pipeline_stage_name:
+                cursor.execute("""
+                    SELECT pipeline_stage_name FROM opportunity_report
                     WHERE pipeline_stage_id = %s
                       AND pipeline_stage_name IS NOT NULL AND pipeline_stage_name <> ''
+                      AND pipeline_stage_name <> pipeline_stage_id
                     LIMIT 1
                 """, [pipeline_stage_id])
                 row = cursor.fetchone()
                 if row:
                     pipeline_stage_name = row[0]
     except Exception as e:
-        logger.warning("DB name lookup failed for pipeline %s: %s", pipeline_id, e)
-
-    # Both found from DB — no API call needed
-    if pipeline_name and (pipeline_stage_name or not pipeline_stage_id):
-        return pipeline_name, pipeline_stage_name
-
-    # --- Step 2: Fall back to GHL pipelines API ---
-    try:
-        client = GHLClient(location_id=location_id)
-        pipelines = client.get_pipelines()
-        for p in pipelines:
-            if not isinstance(p, dict) or p.get('id') != pipeline_id:
-                continue
-            pipeline_name = p.get('name') or p.get('pipelineName') or pipeline_name
-            for stage in (p.get('stages') or []):
-                if isinstance(stage, dict) and stage.get('id') == pipeline_stage_id:
-                    pipeline_stage_name = stage.get('name') or stage.get('stageName') or pipeline_stage_name
-                    break
-            break
-    except Exception as e:
-        logger.warning("GHL pipelines API fallback failed for location %s pipeline %s: %s",
-                       location_id, pipeline_id, e)
+        logger.warning("DB name fallback failed for pipeline %s: %s", pipeline_id, e)
 
     return pipeline_name, pipeline_stage_name
 

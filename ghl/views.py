@@ -336,20 +336,36 @@ class PipelinesListView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        from .webhook_handlers import BLOCKED_PIPELINE_IDS
         try:
-            # Fetch all distinct (pipeline_id, pipeline_name, pipeline_stage_id, pipeline_stage_name)
-            # combinations that actually exist in the DB
+            # Build a placeholder list for the NOT IN clause
+            blocked = list(BLOCKED_PIPELINE_IDS) or ['__none__']
+            placeholders = ', '.join(['%s'] * len(blocked))
+
             with connection.cursor() as cursor:
-                cursor.execute("""
-                    SELECT DISTINCT
+                cursor.execute(f"""
+                    SELECT
                         pipeline_id,
-                        COALESCE(NULLIF(pipeline_name, ''), pipeline_id)  AS pipeline_name,
+                        -- Prefer a real name over a raw UUID (name <> id check)
+                        COALESCE(
+                            MAX(CASE WHEN pipeline_name <> pipeline_id AND pipeline_name <> '' THEN pipeline_name END),
+                            MAX(NULLIF(pipeline_name, '')),
+                            pipeline_id
+                        ) AS pipeline_name,
                         pipeline_stage_id,
-                        COALESCE(NULLIF(pipeline_stage_name, ''), pipeline_stage_id) AS pipeline_stage_name
+                        -- Same for stage names
+                        COALESCE(
+                            MAX(CASE WHEN pipeline_stage_name <> pipeline_stage_id AND pipeline_stage_name <> '' THEN pipeline_stage_name END),
+                            MAX(NULLIF(pipeline_stage_name, '')),
+                            pipeline_stage_id
+                        ) AS pipeline_stage_name
                     FROM opportunity_report
-                    WHERE pipeline_id IS NOT NULL AND pipeline_id <> ''
+                    WHERE pipeline_id IS NOT NULL
+                      AND pipeline_id <> ''
+                      AND pipeline_id NOT IN ({placeholders})
+                    GROUP BY pipeline_id, pipeline_stage_id
                     ORDER BY pipeline_id, pipeline_stage_id
-                """)
+                """, blocked)
                 rows = cursor.fetchall()
 
             # Group stages under each pipeline
@@ -361,11 +377,14 @@ class PipelinesListView(APIView):
                         'name': pipeline_name,
                         'stages': [],
                     }
-                if stage_id:  # some rows may have no stage
-                    pipelines_dict[pipeline_id]['stages'].append({
-                        'id': stage_id,
-                        'name': stage_name,
-                    })
+                # Only add stage if it has a real ID and not already added
+                if stage_id:
+                    existing_ids = {s['id'] for s in pipelines_dict[pipeline_id]['stages']}
+                    if stage_id not in existing_ids:
+                        pipelines_dict[pipeline_id]['stages'].append({
+                            'id': stage_id,
+                            'name': stage_name,
+                        })
 
             result = list(pipelines_dict.values())
 
@@ -382,6 +401,7 @@ class PipelinesListView(APIView):
         except Exception as e:
             logger.warning("Failed to fetch pipelines from DB: %s", e)
             return Response({'pipelines': [], 'default_pipeline_id': None})
+
 
 
 class OpportunityFiltersView(APIView):
