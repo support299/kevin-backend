@@ -109,8 +109,50 @@ try:
             )
             raise
 
+    @shared_task
+    def sync_custom_fields_schema():
+        """
+        Periodic task: fetch all custom field definitions from GHL API for every active location
+        and ensure their columns exist in opportunity_report and contact_report tables.
+        This proactively keeps the schema up-to-date so webhooks never have to wait for a new field.
+        """
+        from .models import GHLLocation
+        from .services import GHLClient
+        from .custom_fields_utils import (
+            get_cached_custom_fields,
+            field_id_to_column_map,
+            ensure_custom_field_columns,
+            invalidate_cf_cache,
+        )
+
+        active_locations = GHLLocation.objects.filter(status='active')
+        results = []
+        for location in active_locations:
+            lid = location.location_id
+            client = GHLClient(location_id=lid)
+            for model, table in [('contact', 'contact_report'), ('opportunity', 'opportunity_report')]:
+                try:
+                    # Force a fresh fetch by invalidating cache first
+                    invalidate_cf_cache(lid, model)
+                    fields = get_cached_custom_fields(lid, model, client)
+                    id_to_col = field_id_to_column_map(fields)
+                    ensure_custom_field_columns(table, id_to_col)
+                    results.append({'location': lid, 'model': model, 'fields': len(fields), 'status': 'ok'})
+                    logger.info(
+                        "Schema sync done for location=%s model=%s: %d fields",
+                        lid, model, len(fields)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Schema sync failed for location=%s model=%s: %s",
+                        lid, model, exc
+                    )
+                    results.append({'location': lid, 'model': model, 'status': 'error', 'error': str(exc)})
+        return results
+
 except ImportError:
     refresh_ghl_tokens = None
     process_opportunity_webhook_task = None
     process_contact_webhook_task = None
+    sync_custom_fields_schema = None
 

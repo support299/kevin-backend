@@ -186,6 +186,10 @@ try:
             'task': 'ghl.tasks.refresh_ghl_tokens',
             'schedule': crontab(minute=0),  # Every hour at minute 0
         },
+        'sync-custom-fields-schema': {
+            'task': 'ghl.tasks.sync_custom_fields_schema',
+            'schedule': crontab(minute=0, hour='*/2'),  # Every 2 hours
+        },
     }
 except ImportError:
     CELERY_BEAT_SCHEDULE = {}

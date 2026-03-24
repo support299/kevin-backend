@@ -17,6 +17,7 @@ from django.utils import timezone
 
 from .models import GHLLocation, GHLOpportunity
 from .services import GHLClient
+from .custom_fields_utils import sync_and_get_custom_field_values
 
 logger = logging.getLogger(__name__)
 
@@ -251,67 +252,74 @@ def _upsert_opportunity_report(opportunity_id: str, location: GHLLocation, raw_d
         location.location_id, pipe_id, stage_id
     )
 
+    # --- Dynamic custom fields for opportunities ---
+    raw_cf = opp_obj.get('customFields') or []
+    client = GHLClient(location_id=location.location_id)
+    cf_col_values = {}
+    try:
+        cf_col_values = sync_and_get_custom_field_values(
+            location_id=location.location_id,
+            model='opportunity',
+            raw_custom_fields=raw_cf,
+            client=client,
+            table_name='opportunity_report',
+        )
+    except Exception as cf_exc:
+        logger.warning("Custom field sync failed for opportunity %s: %s", opportunity_id, cf_exc)
+
+    # Build base columns and values
+    base_cols = [
+        'opportunity_id', 'pipeline_id', 'pipeline_stage_id', 'pipeline_name', 'pipeline_stage_name',
+        'assigned_to', 'contact_id', 'location_id', 'lost_reason_id', 'opportunity_name',
+        'monetary_value', 'status', 'source', 'last_status_change_at',
+        'last_stage_change_at', 'created_at', 'updated_at', 'created_date',
+        'contact_name', 'email', 'phone', 'company_name',
+    ]
+    base_vals = [
+        opportunity_id,
+        pipe_id,
+        stage_id,
+        pipeline_name,
+        pipeline_stage_name,
+        assigned_to,
+        opp_obj.get('contactId') or '',
+        location.location_id,
+        lost_reason_id,
+        opp_obj.get('name') or '',
+        monetary,
+        opp_obj.get('status') or '',
+        opp_obj.get('source') or '',
+        last_status_change,
+        last_stage_change,
+        created_at,
+        updated_at,
+        created_date_val,
+        contact_name,
+        email,
+        phone_val,
+        company_name,
+    ]
+
+    # Append dynamic custom field columns
+    cf_cols = list(cf_col_values.keys())
+    cf_vals = [cf_col_values[c] for c in cf_cols]
+    all_cols = base_cols + cf_cols
+    all_vals = base_vals + cf_vals
+
+    col_identifiers = ', '.join(f'"{c}"' for c in all_cols)
+    placeholders = ', '.join(['%s'] * len(all_cols))
+    # All columns after opportunity_id are updatable on conflict
+    update_set = ', '.join(f'"{c}" = EXCLUDED."{c}"' for c in all_cols if c != 'opportunity_id')
+
+    sql = f"""
+        INSERT INTO opportunity_report ({col_identifiers})
+        VALUES ({placeholders})
+        ON CONFLICT (opportunity_id) DO UPDATE SET
+            {update_set}
+    """
+
     with connection.cursor() as cursor:
-        cursor.execute("""
-            INSERT INTO opportunity_report (
-                opportunity_id, pipeline_id, pipeline_stage_id, pipeline_name, pipeline_stage_name,
-                assigned_to, contact_id, location_id, lost_reason_id, opportunity_name,
-                monetary_value, status, source, last_status_change_at,
-                last_stage_change_at, created_at, updated_at, created_date,
-                contact_name, email, phone, company_name
-            ) VALUES (
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s,
-                %s, %s, %s, %s,
-                %s, %s, %s, %s
-            )
-            ON CONFLICT (opportunity_id) DO UPDATE SET
-                pipeline_id = EXCLUDED.pipeline_id,
-                pipeline_stage_id = EXCLUDED.pipeline_stage_id,
-                pipeline_name = EXCLUDED.pipeline_name,
-                pipeline_stage_name = EXCLUDED.pipeline_stage_name,
-                assigned_to = EXCLUDED.assigned_to,
-                contact_id = EXCLUDED.contact_id,
-                location_id = EXCLUDED.location_id,
-                lost_reason_id = EXCLUDED.lost_reason_id,
-                opportunity_name = EXCLUDED.opportunity_name,
-                monetary_value = EXCLUDED.monetary_value,
-                status = EXCLUDED.status,
-                source = EXCLUDED.source,
-                last_status_change_at = EXCLUDED.last_status_change_at,
-                last_stage_change_at = EXCLUDED.last_stage_change_at,
-                created_at = EXCLUDED.created_at,
-                updated_at = EXCLUDED.updated_at,
-                created_date = EXCLUDED.created_date,
-                contact_name = EXCLUDED.contact_name,
-                email = EXCLUDED.email,
-                phone = EXCLUDED.phone,
-                company_name = EXCLUDED.company_name
-        """, [
-            opportunity_id,
-            pipe_id,
-            stage_id,
-            pipeline_name,
-            pipeline_stage_name,
-            assigned_to,
-            opp_obj.get('contactId') or '',
-            location.location_id,
-            lost_reason_id,
-            opp_obj.get('name') or '',
-            monetary,
-            opp_obj.get('status') or '',
-            opp_obj.get('source') or '',
-            last_status_change,
-            last_stage_change,
-            created_at,
-            updated_at,
-            created_date_val,
-            contact_name,
-            email,
-            phone_val,
-            company_name,
-        ])
+        cursor.execute(sql, all_vals)
 
 
 def _db_delete_opportunity(opportunity_id: str, max_retries: int = 3):
@@ -476,71 +484,61 @@ def _upsert_contact_report(contact_id: str, location: GHLLocation, raw_data: dic
     attribution_source      = _as_json(c.get('attributionSource'))
     last_attribution_source = _as_json(c.get('lastAttributionSource'))
 
+    # --- Dynamic custom fields for contacts ---
+    raw_cf_list = c.get('customFields') or []
+    _client = GHLClient(location_id=location.location_id)
+    cf_col_values = {}
+    try:
+        cf_col_values = sync_and_get_custom_field_values(
+            location_id=location.location_id,
+            model='contact',
+            raw_custom_fields=raw_cf_list,
+            client=_client,
+            table_name='contact_report',
+        )
+    except Exception as cf_exc:
+        logger.warning("Custom field sync failed for contact %s: %s", contact_id, cf_exc)
+
+    # Base columns (existing schema preserved)
+    base_cols = [
+        'id', 'location_id', 'first_name', 'last_name', 'contact_name',
+        'email', 'phone', 'phone_label', 'company_name', 'business_id', 'business_name',
+        'address', 'city', 'state', 'country', 'postal_code', 'website', 'timezone',
+        'date_added', 'date_updated', 'date_of_birth', 'source', 'type',
+        'valid_email', 'dnd', 'assigned_to',
+        'additional_emails', 'additional_phones', 'tags', 'custom_fields',
+        'dnd_settings', 'inbound_dnd_settings', 'followers', 'opportunities',
+        'attribution_source', 'last_attribution_source',
+    ]
+    base_vals = [
+        contact_id, location.location_id, first_name, last_name, contact_name,
+        email, phone, phone_label, company_name, business_id, business_name,
+        address, city, state, country, postal_code, website, tz,
+        date_added, date_updated, date_of_birth, source, contact_type,
+        valid_email, dnd, assigned_to,
+        additional_emails, additional_phones, tags, custom_fields,
+        dnd_settings, inbound_dnd_settings, followers, opportunities,
+        attribution_source, last_attribution_source,
+    ]
+
+    # Append dynamic custom field columns
+    cf_cols = list(cf_col_values.keys())
+    cf_vals = [cf_col_values[k] for k in cf_cols]
+    all_cols = base_cols + cf_cols
+    all_vals = base_vals + cf_vals
+
+    col_identifiers = ', '.join(f'"{col}"' for col in all_cols)
+    placeholders = ', '.join(['%s'] * len(all_cols))
+    # All columns except primary key 'id' are updatable on conflict
+    update_set = ', '.join(f'"{col}" = EXCLUDED."{col}"' for col in all_cols if col != 'id')
+
+    sql = f"""
+        INSERT INTO contact_report ({col_identifiers})
+        VALUES ({placeholders})
+        ON CONFLICT (id) DO UPDATE SET
+            {update_set}
+    """
+
     with connection.cursor() as cursor:
-        cursor.execute("""
-            INSERT INTO contact_report (
-                id, location_id, first_name, last_name, contact_name,
-                email, phone, phone_label, company_name, business_id, business_name,
-                address, city, state, country, postal_code, website, timezone,
-                date_added, date_updated, date_of_birth, source, type,
-                valid_email, dnd, assigned_to,
-                additional_emails, additional_phones, tags, custom_fields,
-                dnd_settings, inbound_dnd_settings, followers, opportunities,
-                attribution_source, last_attribution_source
-            ) VALUES (
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s,
-                %s, %s, %s, %s,
-                %s, %s, %s, %s,
-                %s, %s
-            )
-            ON CONFLICT (id) DO UPDATE SET
-                location_id             = EXCLUDED.location_id,
-                first_name              = EXCLUDED.first_name,
-                last_name               = EXCLUDED.last_name,
-                contact_name            = EXCLUDED.contact_name,
-                email                   = EXCLUDED.email,
-                phone                   = EXCLUDED.phone,
-                phone_label             = EXCLUDED.phone_label,
-                company_name            = EXCLUDED.company_name,
-                business_id             = EXCLUDED.business_id,
-                business_name           = EXCLUDED.business_name,
-                address                 = EXCLUDED.address,
-                city                    = EXCLUDED.city,
-                state                   = EXCLUDED.state,
-                country                 = EXCLUDED.country,
-                postal_code             = EXCLUDED.postal_code,
-                website                 = EXCLUDED.website,
-                timezone                = EXCLUDED.timezone,
-                date_added              = EXCLUDED.date_added,
-                date_updated            = EXCLUDED.date_updated,
-                date_of_birth           = EXCLUDED.date_of_birth,
-                source                  = EXCLUDED.source,
-                type                    = EXCLUDED.type,
-                valid_email             = EXCLUDED.valid_email,
-                dnd                     = EXCLUDED.dnd,
-                assigned_to             = EXCLUDED.assigned_to,
-                additional_emails       = EXCLUDED.additional_emails,
-                additional_phones       = EXCLUDED.additional_phones,
-                tags                    = EXCLUDED.tags,
-                custom_fields           = EXCLUDED.custom_fields,
-                dnd_settings            = EXCLUDED.dnd_settings,
-                inbound_dnd_settings    = EXCLUDED.inbound_dnd_settings,
-                followers               = EXCLUDED.followers,
-                opportunities           = EXCLUDED.opportunities,
-                attribution_source      = EXCLUDED.attribution_source,
-                last_attribution_source = EXCLUDED.last_attribution_source
-        """, [
-            contact_id, location.location_id, first_name, last_name, contact_name,
-            email, phone, phone_label, company_name, business_id, business_name,
-            address, city, state, country, postal_code, website, tz,
-            date_added, date_updated, date_of_birth, source, contact_type,
-            valid_email, dnd, assigned_to,
-            additional_emails, additional_phones, tags, custom_fields,
-            dnd_settings, inbound_dnd_settings, followers, opportunities,
-            attribution_source, last_attribution_source,
-        ])
+        cursor.execute(sql, all_vals)
 

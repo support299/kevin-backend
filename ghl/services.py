@@ -239,3 +239,17 @@ class GHLClient:
         if isinstance(opportunities, dict) and 'opportunities' in opportunities:
             return opportunities.get('opportunities', [])
         return []
+
+    def get_custom_fields(self, model: str = 'all') -> list:
+        """
+        Fetch all custom fields for this location from GHL API.
+        GET /locations/:locationId/customFields?model=contact|opportunity|all
+        Returns list of custom field dicts with 'id', 'name', 'dataType', 'model', etc.
+        """
+        path = f"/locations/{self.location_id}/customFields"
+        if model and model != 'all':
+            path += f"?model={model}"
+        resp = self._request('GET', path)
+        # GHL returns { "customFields": [...] }
+        fields = resp.get('customFields') or resp.get('customField') or []
+        return fields if isinstance(fields, list) else []
