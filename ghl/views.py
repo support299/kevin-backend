@@ -696,9 +696,9 @@ class GHLWebhookView(APIView):
     permission_classes = [AllowAny]
 
     # Event types that belong to contacts
-    CONTACT_EVENT_TYPES = {'ContactCreate', 'ContactUpdate', 'ContactDelete', 'ContactAdded'}
+    CONTACT_EVENT_TYPES = {'ContactCreate', 'ContactUpdate', 'ContactDelete', 'ContactAdded', 'ContactTagUpdate'}
     # Event types that belong to opportunities
-    OPPORTUNITY_EVENT_TYPES = {'OpportunityCreate', 'OpportunityUpdate', 'OpportunityDelete', 'OpportunityAdded'}
+    OPPORTUNITY_EVENT_TYPES = {'OpportunityCreate', 'OpportunityUpdate', 'OpportunityDelete', 'OpportunityAdded', 'OpportunityStageUpdate', 'OpportunityStatusUpdate'}
 
     def post(self, request):
         import json as json_lib

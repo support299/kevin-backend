@@ -26,7 +26,12 @@ def process_opportunity_webhook(event_type: str, location_id: str, opportunity_i
     """Process opportunity webhook: fetch from GHL then create/update or delete in DB (all pipelines)."""
     if event_type == 'OpportunityDelete':
         _handle_opportunity_delete(location_id, opportunity_id)
-    elif event_type in ('OpportunityUpdate', 'OpportunityCreate', 'OpportunityAdded'):
+    elif event_type in (
+        'OpportunityUpdate', 'OpportunityCreate', 'OpportunityAdded',
+        'OpportunityStageUpdate', 'OpportunityStatusUpdate',
+    ):
+        # For stage/status updates we do a full re-fetch — the GHL API always
+        # returns the latest data, so one fetch covers stage, status, and fields.
         _fetch_and_store_opportunity(location_id, opportunity_id)
     # Unrecognized event_type: no-op
 
@@ -362,11 +367,14 @@ def _db_update_or_create_opportunity(opportunity_id: str, location: GHLLocation,
 def process_contact_webhook(event_type: str, location_id: str, contact_id: str):
     """
     Process contact webhook: fetch from GHL then upsert or delete in contact_report.
-    Supported event types: ContactCreate, ContactUpdate, ContactDelete
+    Supported event types: ContactCreate, ContactUpdate, ContactDelete, ContactTagUpdate
     """
     if event_type == 'ContactDelete':
         _handle_contact_delete(location_id, contact_id)
-    elif event_type in ('ContactCreate', 'ContactUpdate', 'ContactAdded'):
+    elif event_type in ('ContactCreate', 'ContactUpdate', 'ContactAdded', 'ContactTagUpdate'):
+        # ContactTagUpdate: webhook payload only has the contact id.
+        # We do a full re-fetch so that the latest tags list from GHL API
+        # is stored in both the contact_report.tags column and any cf_ columns.
         _fetch_and_store_contact(location_id, contact_id)
     else:
         logger.debug("Unrecognized contact event_type=%s for contact %s", event_type, contact_id)
