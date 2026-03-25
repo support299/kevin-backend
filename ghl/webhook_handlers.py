@@ -82,7 +82,8 @@ def _fetch_and_store_opportunity(location_id: str, opportunity_id: str):
     opp_obj = data.get('opportunity') if isinstance(data.get('opportunity'), dict) else data
     
     # 1. Date Filter: Ignore legacy opportunities created before Dec 1, 2025
-    date_added_str = opp_obj.get('dateAdded')
+    # GHL uses 'dateAdded' for older records and 'createdAt' for newer ones.
+    date_added_str = opp_obj.get('dateAdded') or opp_obj.get('createdAt')
     date_added = _parse_dt(date_added_str)
     if date_added and date_added < SYNC_START_DATE:
         logger.info(
@@ -252,8 +253,9 @@ def _upsert_opportunity_report(opportunity_id: str, location: GHLLocation, raw_d
     email = contact.get('email') or (emails[0].get('email') if emails and isinstance(emails[0], dict) else '') or ''
     phone_val = contact.get('phone') or (phones[0].get('phone') if phones and isinstance(phones[0], dict) else '') or ''
     company_name = contact.get('companyName') or contact.get('company') or ''
-    created_at = _parse_dt(opp_obj.get('dateAdded'))
-    updated_at = _parse_dt(opp_obj.get('dateUpdated')) or timezone.now()
+    # creation date from GHL (older API uses dateAdded, newer uses createdAt)
+    created_at = _parse_dt(opp_obj.get('dateAdded') or opp_obj.get('createdAt'))
+    updated_at = _parse_dt(opp_obj.get('dateUpdated') or opp_obj.get('updatedAt')) or timezone.now()
     last_status_change = _parse_dt(opp_obj.get('lastStatusChangeAt'))
     last_stage_change = _parse_dt(opp_obj.get('lastStageChangeAt'))
     assigned_to = opp_obj.get('assignedTo') or ''
