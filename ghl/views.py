@@ -696,7 +696,7 @@ class GHLWebhookView(APIView):
     permission_classes = [AllowAny]
 
     # Event types that belong to contacts
-    CONTACT_EVENT_TYPES = {'ContactCreate', 'ContactUpdate', 'ContactDelete', 'ContactAdded', 'ContactTagUpdate'}
+    CONTACT_EVENT_TYPES = {'ContactCreate', 'ContactUpdate', 'ContactDelete', 'ContactAdded', 'ContactTagUpdate', 'ContactDndUpdate'}
     # Event types that belong to opportunities
     OPPORTUNITY_EVENT_TYPES = {'OpportunityCreate', 'OpportunityUpdate', 'OpportunityDelete', 'OpportunityAdded', 'OpportunityStageUpdate', 'OpportunityStatusUpdate'}
 
