@@ -11,9 +11,14 @@ BLOCKED_PIPELINE_IDS = {
 }
 import logging
 import time
+from datetime import datetime
 
 from django.db import OperationalError, connection
 from django.utils import timezone
+from django.utils.timezone import make_aware
+
+# Global sync start date (records created before this will be ignored)
+SYNC_START_DATE = make_aware(datetime(2025, 12, 1))
 
 from .models import GHLLocation, GHLOpportunity
 from .services import GHLClient
@@ -72,9 +77,21 @@ def _fetch_and_store_opportunity(location_id: str, opportunity_id: str):
         logger.error("GHL API error fetching opportunity %s: %s", opportunity_id, exc)
         raise
 
-    # Extract the pipeline ID from the fetched opportunity and check if it is blocked
+    # Extract common fields
     data = full_opportunity if isinstance(full_opportunity, dict) else {}
     opp_obj = data.get('opportunity') if isinstance(data.get('opportunity'), dict) else data
+    
+    # 1. Date Filter: Ignore legacy opportunities created before Dec 1, 2025
+    date_added_str = opp_obj.get('dateAdded')
+    date_added = _parse_dt(date_added_str)
+    if date_added and date_added < SYNC_START_DATE:
+        logger.info(
+            "Skipping legacy opportunity %s - created on %s (before %s)",
+            opportunity_id, date_added_str, SYNC_START_DATE
+        )
+        return
+
+    # 2. Pipeline Filter: Skip blocked pipelines
     pipeline_id = opp_obj.get('pipelineId') or ''
     if pipeline_id in BLOCKED_PIPELINE_IDS:
         logger.info(
@@ -407,6 +424,20 @@ def _fetch_and_store_contact(location_id: str, contact_id: str):
     except Exception as exc:
         logger.error("GHL API error fetching contact %s: %s", contact_id, exc)
         raise
+
+    # GHL wraps the contact under "contact" key
+    data = full_contact if isinstance(full_contact, dict) else {}
+    c = data.get('contact') if isinstance(data.get('contact'), dict) else data
+    
+    # Date Filter: Ignore legacy contacts created before Dec 1, 2025
+    date_added_str = c.get('dateAdded')
+    date_added_dt = _parse_dt(date_added_str)
+    if date_added_dt and date_added_dt < SYNC_START_DATE:
+        logger.info(
+            "Skipping legacy contact %s - created on %s (before %s)",
+            contact_id, date_added_str, SYNC_START_DATE
+        )
+        return
 
     _upsert_contact_report(contact_id, location, full_contact)
     logger.info("Stored contact %s for location %s", contact_id, location_id)
