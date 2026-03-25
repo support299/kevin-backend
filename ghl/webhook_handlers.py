@@ -384,11 +384,14 @@ def _db_update_or_create_opportunity(opportunity_id: str, location: GHLLocation,
 def process_contact_webhook(event_type: str, location_id: str, contact_id: str):
     """
     Process contact webhook: fetch from GHL then upsert or delete in contact_report.
-    Supported event types: ContactCreate, ContactUpdate, ContactDelete, ContactTagUpdate
+    Supported event types: ContactCreate, ContactUpdate, ContactDelete, ContactTagUpdate, ContactDndUpdate
     """
     if event_type == 'ContactDelete':
         _handle_contact_delete(location_id, contact_id)
-    elif event_type in ('ContactCreate', 'ContactUpdate', 'ContactAdded', 'ContactTagUpdate'):
+    elif event_type in (
+        'ContactCreate', 'ContactUpdate', 'ContactAdded',
+        'ContactTagUpdate', 'ContactDndUpdate'
+    ):
         # ContactTagUpdate: webhook payload only has the contact id.
         # We do a full re-fetch so that the latest tags list from GHL API
         # is stored in both the contact_report.tags column and any cf_ columns.
