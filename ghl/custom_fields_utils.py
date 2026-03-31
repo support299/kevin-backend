@@ -201,7 +201,9 @@ def extract_custom_field_values(raw_custom_fields, id_to_col: dict) -> dict:
         if not isinstance(item, dict):
             continue
         fid = item.get('id') or item.get('fieldId')
-        val = item.get('value')
+        # GHL opportunity API returns "fieldValue"; contact API returns "value".
+        # Check both to stay compatible with all endpoints.
+        val = item.get('fieldValue') if 'fieldValue' in item else item.get('value')
         col = id_to_col.get(fid)
         if col is None:
             continue  # field not in our definitions (maybe newly added, next sync will pick it up)
